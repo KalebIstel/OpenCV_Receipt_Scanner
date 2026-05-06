@@ -1,75 +1,106 @@
-# Receipt Scanner - venv Setup (No Docker)
+# Receipt Scanner - Git Bash venv Setup (No Docker)
 
-This project can be moved to another laptop and run with Python virtual environment (`venv`).
+This guide is for running the project from a **Git Bash** terminal on Windows.
 
-## 1) Prerequisites on target laptop
+## 1) Prerequisites
 
 - Python 3.10+ installed and available in PATH
 - Tesseract OCR installed and available in PATH (`tesseract --version`)
 - A webcam (optional, for camera mode)
 
-## 2) Copy project
+## 2) Open project in Git Bash
 
-Copy the entire `receipt_scanner` folder to the new laptop.
+From Git Bash:
+
+```bash
+cd /d/Coding/OpenCV/OpenCV_Receipt_Scanner
+```
 
 ## 3) Create and activate virtual environment
 
 From inside the project folder:
 
-### Windows PowerShell
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/Scripts/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Windows CMD
-
-```bat
-python -m venv .venv
-.\.venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+When activated, your prompt should show `(.venv)`.
 
 ## 4) Verify installation
 
-```powershell
+```bash
 python -c "import cv2, numpy, pytesseract, flask; print('OK')"
 tesseract --version
 ```
 
-## 5) Run examples
+## 5) Run examples (Git Bash)
 
-### Main scanner with camera
+### A) Live camera view + manual capture
 
-```powershell
-.\run_camera.ps1
+Shows real-time camera preview and scanner preview windows.  
+Press **Enter** or **Space** to capture, **Q** or **Esc** to cancel.
+
+```bash
+python receipt_scanner.py --camera --live-preview
 ```
 
-Or:
+### B) Live camera view + auto capture
 
-```powershell
-python .\receipt_scanner.py --camera
+Auto-captures when the receipt is stable and aligned.
+
+```bash
+python receipt_scanner.py --camera --auto-capture
 ```
 
-### Scan one receipt image
+Optional: tune stability requirement (default `12` frames):
 
-```powershell
-python .\receipt_scanner.py .\sample.jpg
+```bash
+python receipt_scanner.py --camera --auto-capture --stable-frames 16
 ```
 
-### Start advanced API
+### C) Live camera view without scanner preview window
 
-```powershell
-python .\receipt_scanner_advanced.py --api
+Use this if you only want one camera window:
+
+```bash
+python receipt_scanner.py --camera --live-preview --no-scanner-preview
+```
+
+### D) Scan one receipt image file
+
+```bash
+python receipt_scanner.py sample.jpg
+```
+
+### E) Batch scan all images in a folder
+
+```bash
+python receipt_scanner.py --batch sample_receipts
+```
+
+### F) Show stats
+
+```bash
+python receipt_scanner.py --stats
+```
+
+### G) Export to CSV
+
+```bash
+python receipt_scanner.py --export receipts_export.csv
+```
+
+## 6) Deactivate virtual environment
+
+```bash
+deactivate
 ```
 
 ## Notes
 
-- The SQLite database file defaults to `receipts.db` in the project folder.
-- Scanned images are stored in `scanned_receipts`.
-- If Tesseract is installed but not in PATH, either add it to PATH or set
-  `pytesseract.pytesseract.tesseract_cmd` to the full `tesseract.exe` path.
+- Default SQLite database: `receipts.db` (project root).
+- Processed images are saved to `scanned_receipts`.
+- If Tesseract is installed but not detected, add it to PATH or set `pytesseract.pytesseract.tesseract_cmd` to full `tesseract.exe` path.
