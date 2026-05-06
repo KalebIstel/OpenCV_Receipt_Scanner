@@ -127,6 +127,12 @@ Exit SQLite shell:
 .quit
 ```
 
+PowerShell alternative (no `sqlite3` CLI required):
+
+```powershell
+python -c "import sqlite3; c=sqlite3.connect('receipts.db'); [print(r) for r in c.execute('SELECT id, timestamp, vendor, date, total, confidence FROM receipts ORDER BY id DESC LIMIT 10')]; c.close()"
+```
+
 ## 7) Deactivate virtual environment
 
 ```bash
