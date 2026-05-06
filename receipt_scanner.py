@@ -119,8 +119,14 @@ class ReceiptPreprocessor:
                                        cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
+        min_area_ratio = 0.20  # Ignore tiny quads (logos/boxes)
+        img_area = resized.shape[0] * resized.shape[1]
+
         # Find contour with 4 vertices (quadrilateral)
         for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < (img_area * min_area_ratio):
+                continue
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
             if len(approx) == 4:
@@ -281,9 +287,14 @@ class ReceiptPreprocessor:
         if auto_detect:
             pts = self.detect_document_contour(img)
             if pts is not None:
-                img = self.perspective_transform(img, pts)
+                candidate = self.perspective_transform(img, pts)
+                # Keep perspective output only when it is not an implausibly tiny crop.
+                if candidate.shape[0] * candidate.shape[1] >= (img.shape[0] * img.shape[1] * 0.20):
+                    img = candidate
+                else:
+                    print("Warning: Perspective crop too small. Using full image.")
                 if self.debug:
-                    cv2.imwrite(str(self.debug_dir / "02_perspective.jpg"), img)
+                    cv2.imwrite(str(self.debug_dir / "02_perspective.jpg"), candidate)
             else:
                 print("Warning: Could not detect document contour. Using full image.")
 
@@ -327,6 +338,7 @@ class ReceiptOCR:
         passes = [
             (img, base_config),
             (img, '--oem 3 --psm 4 -c preserve_interword_spaces=1'),
+            (img, '--oem 3 --psm 11 -c preserve_interword_spaces=1'),
             (cv2.bitwise_not(img), base_config),
         ]
 
@@ -396,6 +408,50 @@ class ReceiptOCR:
             return " | ".join(location_lines[:4])
         return None
 
+    def _extract_date_time(self, text: str, lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract date and time from common transaction strings such as:
+        06.05.26-15:20/...
+        19 04.26-17:32/...
+        """
+        # 1) Prefer line-level parsing where time is present.
+        for line in lines:
+            if re.search(r'\d{1,2}[:.]\d{2}', line):
+                # Any date-like token before time.
+                dt = re.search(
+                    r'(\d{1,2}\s+\d{1,2}[./-]\d{2,4}|\d{1,2}(?:[./-]\d{1,2}){1,2})\s*[- ]\s*(\d{1,2}[:.]\d{2})',
+                    line
+                )
+                if dt:
+                    raw_date = dt.group(1)
+                    time_val = dt.group(2).replace('.', ':')
+                    # Normalize DD MM.YY -> DD.MM.YY style
+                    if re.match(r'^\d{1,2}\s+\d{1,2}[./-]\d{2,4}$', raw_date):
+                        raw_date = raw_date.replace(' ', '.')
+                    date_val = raw_date.replace('.', '/').replace('-', '/')
+                    return date_val, time_val
+
+                # Fallback: find a date token anywhere on the same line.
+                date_token = re.search(r'\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b', line)
+                time_token = re.search(r'\b\d{1,2}[:.]\d{2}\b', line)
+                if date_token and time_token:
+                    return (
+                        date_token.group(0).replace('.', '/').replace('-', '/'),
+                        time_token.group(0).replace('.', ':')
+                    )
+
+        # 2) Global fallback.
+        dt_match = re.search(
+            r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s*[- ]\s*(\d{1,2}[:.]\d{2})',
+            text
+        )
+        if dt_match:
+            return (
+                dt_match.group(1).replace('.', '/').replace('-', '/'),
+                dt_match.group(2).replace('.', ':')
+            )
+        return None, None
+
     def _extract_items_indomaret(self, lines: List[str]) -> List[Dict]:
         """Extract line-items using Indonesian minimarket row patterns."""
         items: List[Dict] = []
@@ -413,7 +469,34 @@ class ReceiptOCR:
             r'^(?P<name>.+?)\s+(?P<total>[0-9][0-9.,]{2,})$'
         )
 
-        for line in lines:
+        def is_plausible_item_name(name: str) -> bool:
+            name = name.strip()
+            if len(name) < 3 or len(name) > 40:
+                return False
+            if ':' in name:
+                return False
+            letters = [c for c in name if c.isalpha()]
+            if not letters:
+                return False
+            upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+            if upper_ratio < 0.65:
+                return False
+            return True
+
+        # Parse only inside body block: after transaction datetime and before total block.
+        start_idx = 0
+        end_idx = len(lines)
+        dt_line_pattern = re.compile(r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[- ]\s*\d{1,2}[:.]\d{2}')
+        for i, line in enumerate(lines):
+            if dt_line_pattern.search(line):
+                start_idx = i + 1
+                break
+        for i in range(start_idx, len(lines)):
+            if 'TOTAL BELANJA' in lines[i].upper() or re.match(r'^TOTAL\b', lines[i].upper()):
+                end_idx = i
+                break
+
+        for line in lines[start_idx:end_idx]:
             upper = line.upper()
             if any(keyword in upper for keyword in ignore_keywords):
                 continue
@@ -426,7 +509,11 @@ class ReceiptOCR:
                 qty = m3.group('qty')
                 unit_price = self._parse_idr_amount(m3.group('unit'))
                 total_price = self._parse_idr_amount(m3.group('total'))
-                if name and total_price:
+                if (
+                    name and total_price and
+                    int(total_price) >= 1000 and
+                    is_plausible_item_name(name)
+                ):
                     item = {
                         'description': name,
                         'quantity': int(qty),
@@ -440,8 +527,49 @@ class ReceiptOCR:
             if m1:
                 name = m1.group('name').strip()
                 total_price = self._parse_idr_amount(m1.group('total'))
-                if name and total_price and not re.search(r'^\d+$', name):
+                if (
+                    name and total_price and
+                    int(total_price) >= 1000 and
+                    is_plausible_item_name(name) and
+                    not re.search(r'\d{3,}\s*$', name)
+                ):
                     items.append({'description': name, 'price': total_price})
+
+        # Second pass: multi-line rows (name on one line, qty/price on next lines)
+        amount_pat = re.compile(r'\b\d[\d.,]{2,}\b')
+        idx = start_idx
+        while idx < end_idx:
+            name_line = lines[idx].strip()
+            upper = name_line.upper()
+            if (
+                len(name_line) >= 5 and
+                is_plausible_item_name(name_line) and
+                not any(keyword in upper for keyword in ignore_keywords)
+            ):
+                window = " ".join(lines[idx + 1:min(idx + 4, end_idx)])
+                amounts = amount_pat.findall(window)
+                qty_match = re.search(r'\b([1-9]\d{0,2})\b', window)
+                if amounts:
+                    total_price = self._parse_idr_amount(amounts[-1])
+                    unit_price = self._parse_idr_amount(amounts[-2]) if len(amounts) >= 2 else total_price
+                    if total_price and int(total_price) >= 1000:
+                        item = {
+                            'description': re.sub(r'^[^A-Za-z0-9/]+', '', re.sub(r'\s+\d[\d.,]{2,}$', '', name_line)).strip(),
+                            'price': total_price
+                        }
+                        if not is_plausible_item_name(item['description']):
+                            idx += 1
+                            continue
+                        if qty_match:
+                            item['quantity'] = int(qty_match.group(1))
+                        if unit_price:
+                            item['unit_price'] = unit_price
+                        if not any(existing.get('description') == item['description'] and
+                                   existing.get('price') == item['price'] for existing in items):
+                            items.append(item)
+                        idx += 3
+                        continue
+            idx += 1
 
         return items
 
@@ -467,20 +595,21 @@ class ReceiptOCR:
         lines = [line.strip() for line in text.split('\n') if line.strip()]
 
         # Vendor + location
-        if 'INDOMARET' in text.upper():
+        upper_text = text.upper()
+        if re.search(r'INDOMAR|KLIKINDOM|INDO', upper_text):
             data['vendor'] = 'Indomaret'
         data['location'] = self._extract_location(lines)
         if not data['vendor'] and lines:
-            data['vendor'] = lines[0]
+            first = lines[0]
+            if len(first) >= 3 and re.search(r'[A-Za-z]', first):
+                data['vendor'] = first
 
         # Extract Indonesian date/time patterns, e.g. 06.05.26-15:20/...
-        dt_match = re.search(
-            r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s*[- ]\s*(\d{1,2}[:.]\d{2})',
-            text
-        )
-        if dt_match:
-            data['date'] = dt_match.group(1).replace('.', '/').replace('-', '/')
-            data['time'] = dt_match.group(2).replace('.', ':')
+        parsed_date, parsed_time = self._extract_date_time(text, lines)
+        if parsed_date:
+            data['date'] = parsed_date
+        if parsed_time:
+            data['time'] = parsed_time
 
         # Fallback date extraction
         date_patterns = [
