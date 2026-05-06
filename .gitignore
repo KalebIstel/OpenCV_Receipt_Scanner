@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local runtime data
+receipts.db
+debug_output/
+scanned_receipts/
+tmp/
