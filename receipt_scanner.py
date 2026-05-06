@@ -814,6 +814,7 @@ class ReceiptDatabase:
     def get_stats(self) -> Dict:
         """Get spending statistics."""
         with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.execute('''
                 SELECT
                     COUNT(*) as total_receipts,
