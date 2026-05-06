@@ -21,6 +21,7 @@ import os
 import sys
 import csv
 import argparse
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -835,6 +836,186 @@ class ReceiptScanner:
         self.db = ReceiptDatabase(db_path)
         self.debug = debug
 
+    def _open_camera_stream(self, camera_id: int = 0) -> cv2.VideoCapture:
+        """Open camera stream with backend fallbacks."""
+        backends = [None]
+        if os.name == "nt":
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]
+
+        last_error = "Unknown camera stream error"
+        for backend in backends:
+            if backend is None:
+                cap = cv2.VideoCapture(camera_id)
+            else:
+                cap = cv2.VideoCapture(camera_id, backend)
+
+            if cap.isOpened():
+                return cap
+            cap.release()
+            last_error = f"Could not open camera stream {camera_id} (backend={backend})"
+
+        raise RuntimeError(last_error)
+
+    def _evaluate_capture_quality(
+        self,
+        frame: np.ndarray,
+        prev_gray: Optional[np.ndarray] = None
+    ) -> Dict:
+        """
+        Evaluate frame quality for live auto-capture.
+        Returns metrics, booleans, and optional contour points.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        frame_area = float(h * w)
+
+        pts = self.preprocessor.detect_document_contour(frame)
+        contour_ok = pts is not None
+        area_ratio = 0.0
+        aspect_ratio = 0.0
+        if pts is not None:
+            rect = self.preprocessor.order_points(pts)
+            (tl, tr, br, bl) = rect
+            width = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
+            height = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
+            if width > 0 and height > 0:
+                area_ratio = float((width * height) / frame_area)
+                aspect_ratio = float(max(width, height) / min(width, height))
+
+        brightness = float(np.mean(gray))
+        blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if prev_gray is None:
+            motion = 0.0
+        else:
+            motion = float(np.mean(cv2.absdiff(gray, prev_gray)))
+
+        checks = {
+            "contour": contour_ok,
+            "size": area_ratio >= 0.20,
+            "aspect": 1.4 <= aspect_ratio <= 4.5 if contour_ok else False,
+            "focus": blur_var >= 80.0,
+            "exposure": 70.0 <= brightness <= 205.0,
+            "steady": motion <= 6.0 if prev_gray is not None else True,
+        }
+
+        ready = all(checks.values())
+        hint = "Ready - press Enter/Space"
+        if not checks["contour"]:
+            hint = "Find receipt edges"
+        elif not checks["size"]:
+            hint = "Move closer"
+        elif not checks["aspect"]:
+            hint = "Align receipt shape"
+        elif not checks["focus"]:
+            hint = "Hold still (blurry)"
+        elif not checks["exposure"]:
+            hint = "Adjust lighting"
+        elif not checks["steady"]:
+            hint = "Hold steady"
+
+        return {
+            "pts": pts,
+            "checks": checks,
+            "ready": ready,
+            "hint": hint,
+            "brightness": brightness,
+            "blur_var": blur_var,
+            "motion": motion,
+        }
+
+    def capture_live_receipt(
+        self,
+        camera_id: int = 0,
+        auto_capture: bool = False,
+        stable_frames: int = 12,
+        show_scanner_preview: bool = True
+    ) -> Optional[np.ndarray]:
+        """
+        Live receipt capture with visual guidance.
+        - Enter/Space: manual capture
+        - Q/Esc: cancel
+        - Auto mode captures after stable 'ready' frames
+        """
+        cap = self._open_camera_stream(camera_id)
+        prev_gray = None
+        stable_count = 0
+        captured = None
+        countdown_started_at = None
+        countdown_seconds = 1.5
+
+        print("Live view started.")
+        print("Controls: Enter/Space capture | Q/Esc cancel")
+        if auto_capture:
+            print("Auto-capture enabled.")
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+
+                quality = self._evaluate_capture_quality(frame, prev_gray)
+                prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                if quality["ready"]:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                    countdown_started_at = None
+
+                preview = frame.copy()
+                pts = quality["pts"]
+                if pts is not None:
+                    poly = pts.reshape((-1, 1, 2)).astype(np.int32)
+                    color = (0, 255, 0) if quality["ready"] else (0, 200, 255)
+                    cv2.polylines(preview, [poly], True, color, 2)
+
+                status_color = (0, 255, 0) if quality["ready"] else (0, 200, 255)
+                cv2.putText(preview, quality["hint"], (20, 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2)
+                cv2.putText(preview,
+                            f"Focus:{quality['blur_var']:.0f} Light:{quality['brightness']:.0f} Motion:{quality['motion']:.1f}",
+                            (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                cv2.putText(preview,
+                            f"Stable: {stable_count}/{stable_frames}",
+                            (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+                if auto_capture and stable_count >= stable_frames:
+                    if countdown_started_at is None:
+                        countdown_started_at = time.time()
+                    elapsed = time.time() - countdown_started_at
+                    remaining = max(0.0, countdown_seconds - elapsed)
+                    cv2.putText(preview, f"Auto capture in {remaining:.1f}s",
+                                (20, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                    if elapsed >= countdown_seconds:
+                        captured = frame.copy()
+                        break
+
+                if show_scanner_preview:
+                    if pts is not None:
+                        candidate = self.preprocessor.perspective_transform(frame, pts)
+                    else:
+                        candidate = frame
+                    try:
+                        deskewed = self.preprocessor.deskew(candidate)
+                        enhanced = self.preprocessor.enhance_for_ocr(deskewed)
+                        cv2.imshow("Scanner Preview", enhanced)
+                    except Exception:
+                        cv2.imshow("Scanner Preview", candidate)
+
+                cv2.imshow("Camera Preview", preview)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (13, 32):  # Enter / Space
+                    captured = frame.copy()
+                    break
+                if key in (27, ord('q'), ord('Q')):
+                    break
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+
+        return captured
+
     def scan(self, source, auto_detect: bool = True,
              save_image: bool = True) -> Dict:
         """
@@ -944,6 +1125,14 @@ def main():
     parser.add_argument("source", nargs="?", help="Image path or camera index")
     parser.add_argument("--camera", "-c", action="store_true",
                        help="Use camera for capture")
+    parser.add_argument("--live-preview", action="store_true",
+                       help="Show live camera/scanner preview before capture")
+    parser.add_argument("--auto-capture", action="store_true",
+                       help="Auto-capture when receipt is aligned and stable")
+    parser.add_argument("--stable-frames", type=int, default=12,
+                       help="Stable ready frames required before auto-capture")
+    parser.add_argument("--no-scanner-preview", action="store_true",
+                       help="Disable second scanner preview window in live mode")
     parser.add_argument("--batch", "-b", help="Process all images in folder")
     parser.add_argument("--debug", "-d", action="store_true",
                        help="Enable debug mode with intermediate images")
@@ -978,10 +1167,22 @@ def main():
 
     elif args.camera or (args.source and args.source.isdigit()):
         cam_id = int(args.source) if args.source else 0
-        print(f"Capturing from camera {cam_id}...")
-        print("Press Enter when ready (or Ctrl+C to cancel)")
-        input()
-        scanner.scan(cam_id)
+        if args.live_preview or args.auto_capture:
+            frame = scanner.capture_live_receipt(
+                camera_id=cam_id,
+                auto_capture=args.auto_capture,
+                stable_frames=max(1, args.stable_frames),
+                show_scanner_preview=not args.no_scanner_preview
+            )
+            if frame is None:
+                print("Capture canceled.")
+                return
+            scanner.scan(frame)
+        else:
+            print(f"Capturing from camera {cam_id}...")
+            print("Press Enter when ready (or Ctrl+C to cancel)")
+            input()
+            scanner.scan(cam_id)
 
     elif args.source:
         scanner.scan(args.source)
