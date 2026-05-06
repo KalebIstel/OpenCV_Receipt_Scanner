@@ -236,15 +236,26 @@ class ReceiptPreprocessor:
             gray = cv2.resize(gray, None, fx=scale, fy=scale,
                              interpolation=cv2.INTER_CUBIC)
 
-        # Adaptive thresholding for better contrast
-        binary = cv2.adaptiveThreshold(gray, 255,
-                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 11, 2)
+        # Normalize local contrast (useful for phone-camera shadows)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        contrast = clahe.apply(gray)
 
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(binary, None, 10, 7, 21)
+        # Denoise while preserving edges of receipt text
+        denoised = cv2.bilateralFilter(contrast, 9, 75, 75)
 
-        return denoised
+        # Adaptive thresholding for uneven lighting
+        binary = cv2.adaptiveThreshold(
+            denoised, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 12
+        )
+
+        # Small morphology cleanup to strengthen text strokes
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.medianBlur(cleaned, 3)
+
+        return cleaned
 
     def process(self, source, auto_detect: bool = True) -> np.ndarray:
         """
@@ -301,24 +312,149 @@ class ReceiptOCR:
 
         # Tesseract config optimized for receipts
         self.configs = {
-            'receipt': '--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,/$%&()-:; ',
+            'receipt': '--oem 3 --psm 6 -c preserve_interword_spaces=1 '
+                       '-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,/$%&()-:; ',
             'detailed': '--psm 4',
             'raw': '--psm 3'
         }
 
     def extract_text(self, img: np.ndarray, mode: str = 'receipt') -> str:
-        """Extract text from preprocessed image."""
-        config = self.configs.get(mode, self.configs['receipt'])
-        text = pytesseract.image_to_string(img, config=config)
-        return text
+        """
+        Extract text from preprocessed image.
+        Runs multiple OCR passes and returns the most informative result.
+        """
+        base_config = self.configs.get(mode, self.configs['receipt'])
+        passes = [
+            (img, base_config),
+            (img, '--oem 3 --psm 4 -c preserve_interword_spaces=1'),
+            (cv2.bitwise_not(img), base_config),
+        ]
+
+        texts: List[str] = []
+        for ocr_img, config in passes:
+            try:
+                text = pytesseract.image_to_string(ocr_img, config=config)
+                texts.append(text)
+            except Exception:
+                continue
+
+        if not texts:
+            return ""
+
+        def score(candidate: str) -> int:
+            lines = [ln.strip() for ln in candidate.split('\n') if ln.strip()]
+            digits = sum(ch.isdigit() for ch in candidate)
+            keywords = ['TOTAL', 'BELANJA', 'INDOMARET', 'TUNAI', 'PPN']
+            keyword_hits = sum(1 for key in keywords if key in candidate.upper())
+            return len(lines) + digits + (5 * keyword_hits)
+
+        return max(texts, key=score)
+
+    def _normalize_ocr_text(self, text: str) -> str:
+        """Normalize common OCR artifacts for Indonesian receipt parsing."""
+        replacements = {
+            '—': '-',
+            '_': '-',
+            '“': '"',
+            '”': '"',
+            '|': '1',
+        }
+        out = text
+        for old, new in replacements.items():
+            out = out.replace(old, new)
+        return out
+
+    def _parse_idr_amount(self, token: str) -> Optional[str]:
+        """Parse and normalize amount token into canonical integer-like IDR string."""
+        if not token:
+            return None
+        cleaned = re.sub(r'[^0-9.,]', '', token)
+        if not cleaned:
+            return None
+        digits = re.sub(r'[^0-9]', '', cleaned)
+        if not digits:
+            return None
+        return digits
+
+    def _extract_location(self, lines: List[str]) -> Optional[str]:
+        """
+        Extract top location block (before first separator/date).
+        This follows common Indomaret receipt structure.
+        """
+        location_lines = []
+        stop_tokens = ('TOTAL', 'BELANJA', 'PPN', 'QR', 'TRXID')
+        for line in lines[:12]:
+            if re.search(r'\d{2}[./-]\d{2}[./-]\d{2,4}', line):
+                break
+            if re.match(r'^[-=]{4,}$', line):
+                break
+            if any(token in line.upper() for token in stop_tokens):
+                break
+            if len(line) >= 4:
+                location_lines.append(line)
+        if location_lines:
+            return " | ".join(location_lines[:4])
+        return None
+
+    def _extract_items_indomaret(self, lines: List[str]) -> List[Dict]:
+        """Extract line-items using Indonesian minimarket row patterns."""
+        items: List[Dict] = []
+        ignore_keywords = (
+            'TOTAL', 'BELANJA', 'TUNAI', 'NON TUNAI', 'KEMBALI', 'PPN', 'DPP',
+            'HARGA JUAL', 'LAYANAN', 'KONTAK', 'SMS/WA', 'TRXID', 'CANCEL'
+        )
+
+        # Pattern: <name> <qty> <unit_price> <line_total>
+        pattern_three_numbers = re.compile(
+            r'^(?P<name>.+?)\s+(?P<qty>\d{1,3})\s+(?P<unit>[0-9][0-9.,]{2,})\s+(?P<total>[0-9][0-9.,]{2,})$'
+        )
+        # Pattern: <name> <line_total> (fallback)
+        pattern_single_total = re.compile(
+            r'^(?P<name>.+?)\s+(?P<total>[0-9][0-9.,]{2,})$'
+        )
+
+        for line in lines:
+            upper = line.upper()
+            if any(keyword in upper for keyword in ignore_keywords):
+                continue
+            if len(line) < 6:
+                continue
+
+            m3 = pattern_three_numbers.match(line)
+            if m3:
+                name = m3.group('name').strip()
+                qty = m3.group('qty')
+                unit_price = self._parse_idr_amount(m3.group('unit'))
+                total_price = self._parse_idr_amount(m3.group('total'))
+                if name and total_price:
+                    item = {
+                        'description': name,
+                        'quantity': int(qty),
+                        'unit_price': unit_price,
+                        'price': total_price
+                    }
+                    items.append(item)
+                continue
+
+            m1 = pattern_single_total.match(line)
+            if m1:
+                name = m1.group('name').strip()
+                total_price = self._parse_idr_amount(m1.group('total'))
+                if name and total_price and not re.search(r'^\d+$', name):
+                    items.append({'description': name, 'price': total_price})
+
+        return items
 
     def extract_data(self, text: str) -> Dict:
         """
-        Parse OCR text into structured receipt data using regex (fixed patterns).
+        Parse OCR text into structured receipt data.
+        Tuned for Indonesian minimarket receipts (e.g., Indomaret).
         """
+        text = self._normalize_ocr_text(text)
         data = {
             'raw_text': text,
             'vendor': None,
+            'location': None,
             'date': None,
             'time': None,
             'total': None,
@@ -328,58 +464,64 @@ class ReceiptOCR:
             'confidence': 'low'
         }
 
-        lines = [line.strip() for line in text.split('\n') if line.strip()]  # FIXED: '\n' not '\\n'
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-        # Extract date (various formats) - FIXED regex
+        # Vendor + location
+        if 'INDOMARET' in text.upper():
+            data['vendor'] = 'Indomaret'
+        data['location'] = self._extract_location(lines)
+        if not data['vendor'] and lines:
+            data['vendor'] = lines[0]
+
+        # Extract Indonesian date/time patterns, e.g. 06.05.26-15:20/...
+        dt_match = re.search(
+            r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s*[- ]\s*(\d{1,2}[:.]\d{2})',
+            text
+        )
+        if dt_match:
+            data['date'] = dt_match.group(1).replace('.', '/').replace('-', '/')
+            data['time'] = dt_match.group(2).replace('.', ':')
+
+        # Fallback date extraction
         date_patterns = [
             r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b',
+            r'\b(\d{1,2}[.]\d{1,2}[.]\d{2,4})\b',
             r'\b(\d{4}[/-]\d{1,2}[/-]\d{1,2})\b',
             r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4})\b',
         ]
-        for pattern in date_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                data['date'] = match.group(1)
-                break
+        if not data['date']:
+            for pattern in date_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    data['date'] = match.group(1).replace('.', '/').replace('-', '/')
+                    break
 
-        # Extract total amount - FIXED regex
+        # Extract total amount with Indonesian keywords
         total_patterns = [
-            r'(?:TOTAL|Total|AMOUNT DUE|Grand Total)[^\d]*(\d+[.,]\d{2})',
-            r'(?:TOTAL|Total)[^\d]*(\d+[.,]\d{2})',
-            r'\$?\s*(\d+[.,]\d{2})\s*$',  # Last number on receipt
+            r'(?:TOTAL\s*BELANJA|TOTAL)[^\d]*(\d[\d.,]{2,})',
+            r'(?:NON\s*TUNAI|TUNAI)[^\d]*(\d[\d.,]{2,})',
+            r'(?:AMOUNT DUE|Grand Total)[^\d]*(\d[\d.,]{2,})',
         ]
         for pattern in total_patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
-                data['total'] = match.group(1)
+                parsed = self._parse_idr_amount(match.group(1))
+                if parsed:
+                    data['total'] = parsed
                 break
 
-        # Extract tax - FIXED regex
-        tax_match = re.search(r'(?:TAX|Tax|GST|VAT)[^\d]*(\d+[.,]\d{2})',
+        # Extract tax
+        tax_match = re.search(r'(?:PPN|TAX|GST|VAT)[^\d]*(\d[\d.,]{2,})',
                               text, re.IGNORECASE)
         if tax_match:
-            data['tax'] = tax_match.group(1)
+            data['tax'] = self._parse_idr_amount(tax_match.group(1))
 
-        # Extract items (lines with prices) - FIXED regex
-        item_pattern = r'^(.+?)\s+.*?\$?\s*(\d+[.,]\d{2})\s*$'
-        for line in lines:
-            match = re.match(item_pattern, line, re.MULTILINE)
-            if match and not any(x in line.upper() for x in ['TOTAL', 'TAX', 'SUBTOTAL']):
-                data['items'].append({
-                    'description': match.group(1).strip(),
-                    'price': match.group(2)
-                })
-
-        # Vendor detection (first non-empty line or capitalized text)
-        if lines:
-            for line in lines[:5]:
-                if len(line) > 2 and not re.match(r'^[\d\W]+$', line):
-                    data['vendor'] = line
-                    break
+        # Extract items using receipt-row patterns
+        data['items'] = self._extract_items_indomaret(lines)
 
         # Payment method
-        payment_keywords = ['CASH', 'CREDIT', 'DEBIT', 'VISA', 'MASTERCARD',
-                           'AMEX', 'CHECK', 'GIFT CARD']
+        payment_keywords = ['NON TUNAI', 'TUNAI', 'DEBIT', 'CREDIT', 'QR', 'VISA',
+                            'MASTERCARD', 'AMEX', 'CHECK', 'GIFT CARD']
         for keyword in payment_keywords:
             if keyword in text.upper():
                 data['payment_method'] = keyword.title()
@@ -623,12 +765,26 @@ class ReceiptScanner:
 
         return data
 
-    def scan_batch(self, folder_path: str, pattern: str = "*.jpg") -> List[Dict]:
+    def scan_batch(self, folder_path: str, pattern: Optional[str] = None) -> List[Dict]:
         """Process all images in a folder."""
         folder = Path(folder_path)
         results = []
 
-        for img_path in folder.glob(pattern):
+        patterns = [pattern] if pattern else ["*.jpg", "*.jpeg", "*.png", "*.webp"]
+        image_paths = []
+        for p in patterns:
+            image_paths.extend(folder.glob(p))
+
+        # Deduplicate while keeping stable order
+        seen = set()
+        unique_paths = []
+        for img_path in image_paths:
+            key = str(img_path.resolve())
+            if key not in seen:
+                seen.add(key)
+                unique_paths.append(img_path)
+
+        for img_path in unique_paths:
             print(f"\nProcessing: {img_path.name}")
             try:
                 result = self.scan(img_path)
