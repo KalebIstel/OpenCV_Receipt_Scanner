@@ -93,7 +93,41 @@ python receipt_scanner.py --stats
 python receipt_scanner.py --export receipts_export.csv
 ```
 
-## 6) Deactivate virtual environment
+## 6) Inspect saved receipts in SQLite (`receipts.db`)
+
+After scanning, receipt data is stored in `receipts.db` in the project root.
+
+Start SQLite shell:
+
+```bash
+sqlite3 receipts.db
+```
+
+Inside SQLite:
+
+```sql
+.tables
+.schema receipts
+.schema receipt_items
+
+SELECT id, timestamp, vendor, date, total, confidence
+FROM receipts
+ORDER BY id DESC
+LIMIT 20;
+
+SELECT receipt_id, description, price
+FROM receipt_items
+ORDER BY id DESC
+LIMIT 30;
+```
+
+Exit SQLite shell:
+
+```sql
+.quit
+```
+
+## 7) Deactivate virtual environment
 
 ```bash
 deactivate
