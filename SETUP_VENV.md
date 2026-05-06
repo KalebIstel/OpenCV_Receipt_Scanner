@@ -93,6 +93,25 @@ python receipt_scanner.py --stats
 python receipt_scanner.py --export receipts_export.csv
 ```
 
+### H) One-click camera launcher (Windows)
+
+Use the launcher scripts from the project root:
+
+```bash
+run_camera.bat
+```
+
+This opens a quick menu:
+- `1` = Manual capture (live preview, press Enter/Space to capture)
+- `2` = Auto capture (captures when stable and aligned)
+
+You can also launch directly:
+
+```bash
+run_camera.bat manual
+run_camera.bat auto
+```
+
 ## 6) Inspect saved receipts in SQLite (`receipts.db`)
 
 After scanning, receipt data is stored in `receipts.db` in the project root.

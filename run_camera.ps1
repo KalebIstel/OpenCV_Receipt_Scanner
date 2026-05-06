@@ -2,6 +2,9 @@ param(
     [string]$PythonExe = ".\.venv\Scripts\python.exe",
     [string]$ScriptPath = ".\receipt_scanner.py",
     [string]$DatabasePath = ".\receipts.db",
+    [ValidateSet("manual", "auto")]
+    [string]$Mode,
+    [int]$StableFrames = 12,
     [switch]$Debug
 )
 
@@ -36,5 +39,26 @@ if ($Debug) {
     $argsList += "--debug"
 }
 
-Write-Host "Launching camera scanner..." -ForegroundColor Green
+if (-not $Mode) {
+    Write-Host ""
+    Write-Host "Select capture mode:" -ForegroundColor Cyan
+    Write-Host "  [1] Manual capture (live preview; press Enter/Space to capture)"
+    Write-Host "  [2] Auto capture (captures when stable and aligned)"
+    $selection = Read-Host "Enter 1 or 2 (default: 1)"
+    if ($selection -eq "2") {
+        $Mode = "auto"
+    } else {
+        $Mode = "manual"
+    }
+}
+
+if ($Mode -eq "auto") {
+    $argsList += @("--auto-capture", "--stable-frames", "$StableFrames")
+    Write-Host "Launching camera scanner in AUTO mode..." -ForegroundColor Green
+} else {
+    $argsList += "--live-preview"
+    Write-Host "Launching camera scanner in MANUAL mode..." -ForegroundColor Green
+}
+
+Write-Host "Mode: $Mode | DB: $DatabasePath" -ForegroundColor DarkGray
 & $PythonExe @argsList
